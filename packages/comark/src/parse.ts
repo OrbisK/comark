@@ -34,33 +34,46 @@ let nextPluginId = 0
 const pluginIds = new WeakMap<MarkdownExitPlugin, number>()
 const sharedParsers = new Map<string, MarkdownExit>()
 
-/**
- * The built-in plugins, imported on first use so bundles that pass
- * `registerDefaultPlugins: false` do not ship them (or js-yaml with them).
- */
-async function loadDefaultPlugins(options: ParserOptions<any>): Promise<ComarkPlugin<any, any>[]> {
-  const [frontmatterPlugin, html, alert, taskList, components, attributes] = await Promise.all([
+function importDefaultPlugins() {
+  return Promise.all([
     import('./plugins/frontmatter.ts'),
-    // Honor deprecated `html: false` so callers can keep disabling HTML for now.
-    options.html !== false ? import('./plugins/html.ts') : null,
+    import('./plugins/html.ts'),
     import('./plugins/alert.ts'),
     import('./plugins/task-list.ts'),
     import('./plugins/components.ts'),
     import('./plugins/attributes.ts'),
   ])
+}
+type DefaultPluginModules = Awaited<ReturnType<typeof importDefaultPlugins>>
+type AutoCloseMarkdown = typeof import('./internal/parse/auto-close/index.ts').autoCloseMarkdown
+
+let defaultPluginModules: DefaultPluginModules | undefined
+let defaultPluginModulesLoading: Promise<DefaultPluginModules> | undefined
+let autoCloseMarkdown: AutoCloseMarkdown | undefined
+let autoCloseLoading: Promise<AutoCloseMarkdown> | undefined
+
+function loadDefaultPlugins(): Promise<DefaultPluginModules> {
+  return (defaultPluginModulesLoading ??= importDefaultPlugins().then((modules) => (defaultPluginModules = modules)))
+}
+
+function loadAutoClose(): Promise<AutoCloseMarkdown> {
+  return (autoCloseLoading ??= import('./internal/parse/auto-close/index.ts').then(
+    (module) => (autoCloseMarkdown = module.autoCloseMarkdown)
+  ))
+}
+
+function createDefaultPlugins(modules: DefaultPluginModules, options: ParserOptions<any>): ComarkPlugin<any, any>[] {
+  const [frontmatterPlugin, html, alert, taskList, components, attributes] = modules
   return [
     frontmatterPlugin.default(),
-    ...(html ? [html.default()] : []),
+    // Honor deprecated `html: false` so callers can keep disabling HTML for now.
+    ...(options.html !== false ? [html.default()] : []),
     alert.default(),
     taskList.default(),
     components.default(),
     attributes.default(),
   ]
 }
-
-// Imported on the first parse that needs it; afterwards used without awaiting,
-// so later parses take no extra async steps.
-let autoCloseMarkdown: typeof import('./internal/parse/auto-close/index.ts').autoCloseMarkdown | undefined
 
 function getSharedParser(mdPlugins: MarkdownExitPlugin[], linkify: boolean): MarkdownExit {
   const key = [
@@ -131,32 +144,43 @@ export function createMarkdownParser<const TPlugins extends readonly ComarkPlugi
     )
   }
 
-  // Default plugins are imported on the first parse, so plugin setup and the
-  // parser lookup happen then too, once per parser function.
   let plugins: ComarkPlugin<any, any>[] = []
   let parser: MarkdownExit | undefined
-  let setup: Promise<void> | null = null
-  const ensureSetup = () =>
-    (setup ??= (async () => {
-      const defaultPlugins = options.registerDefaultPlugins !== false ? await loadDefaultPlugins(options) : []
-      plugins = dedupePlugins(defaultPlugins, userPlugins)
+  const setup = (defaultPlugins: ComarkPlugin<any, any>[]) => {
+    plugins = dedupePlugins(defaultPlugins, userPlugins)
 
-      const mdPlugins: MarkdownExitPlugin[] = []
-      for (const plugin of plugins) {
-        for (const markdownItPlugin of plugin.markdownItPlugins || []) {
-          mdPlugins.push(markdownItPlugin as unknown as MarkdownExitPlugin)
-        }
+    const mdPlugins: MarkdownExitPlugin[] = []
+    for (const plugin of plugins) {
+      for (const markdownItPlugin of plugin.markdownItPlugins || []) {
+        mdPlugins.push(markdownItPlugin as unknown as MarkdownExitPlugin)
       }
-      parser = getSharedParser(mdPlugins, options.linkify ?? true)
-    })())
+    }
+    parser = getSharedParser(mdPlugins, options.linkify ?? true)
+  }
   const hasPlugin = (name: string) => plugins.some((plugin) => plugin.name === name)
+
+  // Set up right away when nothing has to be imported. Otherwise start the
+  // imports now and let the first parse wait for them if they are not done.
+  let pendingSetup: Promise<void> | undefined
+  if (options.registerDefaultPlugins === false) {
+    setup([])
+  } else if (defaultPluginModules) {
+    setup(createDefaultPlugins(defaultPluginModules, options))
+  } else {
+    pendingSetup = loadDefaultPlugins().then((modules) => setup(createDefaultPlugins(modules, options)))
+    // A failed import is reported by the parse that waits for it.
+    pendingSetup.catch(() => {})
+  }
+  if (autoClose === true && !autoCloseMarkdown) {
+    loadAutoClose().catch(() => {})
+  }
 
   let lastOutput: MarkdownDocument | null = null
   let lastInput: string | null = null
 
   const parseFn: ComarkParseFn = async (markdown, opts = {}) => {
-    // Only the first parse waits; later ones keep the same async steps as before.
-    if (!parser) await ensureSetup()
+    // Only waits while the default plugins are still being imported.
+    if (!parser) await pendingSetup
 
     // Root active span for the full parse pipeline. Nested startActiveSpan /
     // startSpan calls become children (OTel active context, or a stack in a
@@ -200,8 +224,7 @@ export function createMarkdownParser<const TPlugins extends readonly ComarkPlugi
       if (typeof autoClose === 'function') {
         state.markdown = withSpan(tracer, 'comark:autoclose', () => autoClose(state.markdown))
       } else if (autoClose) {
-        autoCloseMarkdown ??= (await import('./internal/parse/auto-close/index.ts')).autoCloseMarkdown
-        const closeMarkdown = autoCloseMarkdown
+        const closeMarkdown = autoCloseMarkdown ?? (await loadAutoClose())
         state.markdown = withSpan(tracer, 'comark:autoclose', () =>
           closeMarkdown(state.markdown, {
             frontmatter: hasPlugin('frontmatter') && opts.streaming,

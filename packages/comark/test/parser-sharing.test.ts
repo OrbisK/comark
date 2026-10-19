@@ -1,12 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 import { createMarkdownParser, defineComarkPlugin } from 'comark'
 import type { MarkdownItPlugin } from 'comark'
 import binding from '../src/plugins/binding'
 
 // The shared instance is internal, so it is observed through the public API: a
 // markdown-it plugin function runs once per instance, so counting how often it
-// is registered counts the instances that were built. Instances are built on a
-// parser's first parse, once the default plugins have been imported.
+// is registered counts the instances that were built.
 let stableUses = 0
 const stableMdPlugin = (() => {
   stableUses++
@@ -28,28 +27,34 @@ const closurePlugin = defineComarkPlugin(() => ({
 }))
 
 describe('parser sharing', () => {
-  it('builds one instance for parsers with the same plugin functions', async () => {
+  // The default plugins are imported once per module; after that, parsers set
+  // up synchronously, which is what the instance counts below rely on.
+  beforeAll(async () => {
+    await createMarkdownParser()('')
+  })
+
+  it('builds one instance for parsers with the same plugin functions', () => {
     const plugin = stablePlugin()
     const before = stableUses
 
     for (let i = 0; i < 20; i++) {
-      await createMarkdownParser({ plugins: [plugin] })('')
+      createMarkdownParser({ plugins: [plugin] })
     }
 
     expect(stableUses - before).toBe(1)
   })
 
-  it('builds one instance per closure when a factory returns a fresh function', async () => {
+  it('builds one instance per closure when a factory returns a fresh function', () => {
     const before = closureUses
 
     for (let i = 0; i < 5; i++) {
-      await createMarkdownParser({ plugins: [closurePlugin()] })('')
+      createMarkdownParser({ plugins: [closurePlugin()] })
     }
 
     expect(closureUses - before).toBe(5)
   })
 
-  it('refreshes cache hits and evicts the least-recently-used shared instance once the cache is full', async () => {
+  it('refreshes cache hits and evicts the least-recently-used shared instance once the cache is full', () => {
     // Dedicated plugins so prior tests in this file cannot keep these keys warm.
     let markedUses = 0
     const markedMdPlugin = (() => {
@@ -69,24 +74,24 @@ describe('parser sharing', () => {
       markdownItPlugins: [oldestMdPlugin],
     }))()
 
-    await createMarkdownParser({ plugins: [markedPlugin] })('')
-    await createMarkdownParser({ plugins: [oldestPlugin] })('')
+    createMarkdownParser({ plugins: [markedPlugin] })
+    createMarkdownParser({ plugins: [oldestPlugin] })
 
     // Capacity is 32. Keep both named entries in the cache, then refresh
     // markedPlugin before inserting one more key so only oldestPlugin ages out.
     for (let i = 0; i < 30; i++) {
-      await createMarkdownParser({ plugins: [closurePlugin()] })('')
+      createMarkdownParser({ plugins: [closurePlugin()] })
     }
 
     expect(markedUses).toBe(1)
     expect(oldestUses).toBe(1)
 
-    await createMarkdownParser({ plugins: [markedPlugin] })('')
-    await createMarkdownParser({ plugins: [closurePlugin()] })('')
+    createMarkdownParser({ plugins: [markedPlugin] })
+    createMarkdownParser({ plugins: [closurePlugin()] })
 
-    await createMarkdownParser({ plugins: [oldestPlugin] })('')
+    createMarkdownParser({ plugins: [oldestPlugin] })
     expect(oldestUses).toBe(2)
-    await createMarkdownParser({ plugins: [markedPlugin] })('')
+    createMarkdownParser({ plugins: [markedPlugin] })
     expect(markedUses).toBe(1)
   })
 
