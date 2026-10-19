@@ -12,15 +12,8 @@ import type {
   Node,
 } from './types.ts'
 import MarkdownExit, { type Token } from 'markdown-exit'
-import components from './plugins/components.ts'
-import attributes from './plugins/attributes.ts'
-import taskList from './plugins/task-list.ts'
-import alert from './plugins/alert.ts'
-import html from './plugins/html.ts'
-import frontmatterPlugin from './plugins/frontmatter.ts'
 import { applyAutoUnwrap, extractReusableNodes } from './internal/parse/utils.ts'
 import { applyUnwrap, resolveUnwrapTags } from './internal/parse/unwrap.ts'
-import { autoCloseMarkdown } from './internal/parse/auto-close/index.ts'
 import { createSerializedTask, dedupePlugins } from './utils/helpers.ts'
 import { noopTracer, withSpan } from './utils/trace.ts'
 import { tokenListToTree } from './internal/parse/tree.ts'
@@ -40,6 +33,57 @@ const MAX_SHARED_PARSERS = 32
 let nextPluginId = 0
 const pluginIds = new WeakMap<MarkdownExitPlugin, number>()
 const sharedParsers = new Map<string, MarkdownExit>()
+
+/**
+ * The built-in plugins, imported on first use so bundles that pass
+ * `registerDefaultPlugins: false` do not ship them (or js-yaml with them).
+ */
+async function loadDefaultPlugins(options: ParserOptions<any>): Promise<ComarkPlugin<any, any>[]> {
+  const [frontmatterPlugin, html, alert, taskList, components, attributes] = await Promise.all([
+    import('./plugins/frontmatter.ts'),
+    // Honor deprecated `html: false` so callers can keep disabling HTML for now.
+    options.html !== false ? import('./plugins/html.ts') : null,
+    import('./plugins/alert.ts'),
+    import('./plugins/task-list.ts'),
+    import('./plugins/components.ts'),
+    import('./plugins/attributes.ts'),
+  ])
+  return [
+    frontmatterPlugin.default(),
+    ...(html ? [html.default()] : []),
+    alert.default(),
+    taskList.default(),
+    components.default(),
+    attributes.default(),
+  ]
+}
+
+// Imported on the first parse that needs it; afterwards used without awaiting,
+// so later parses take no extra async steps.
+let autoCloseMarkdown: typeof import('./internal/parse/auto-close/index.ts').autoCloseMarkdown | undefined
+
+function getSharedParser(mdPlugins: MarkdownExitPlugin[], linkify: boolean): MarkdownExit {
+  const key = [
+    linkify,
+    ...mdPlugins.map((fn) => pluginIds.get(fn) ?? (pluginIds.set(fn, nextPluginId), nextPluginId++)),
+  ].join(',')
+
+  let parser = sharedParsers.get(key)
+  if (parser) {
+    // Touch for LRU: Map iteration order is insertion order.
+    sharedParsers.delete(key)
+    sharedParsers.set(key, parser)
+  } else {
+    parser = new MarkdownExit({ linkify }).enable(['table', 'strikethrough'])
+    for (const fn of mdPlugins) parser.use(fn)
+    if (sharedParsers.size >= MAX_SHARED_PARSERS) {
+      const oldestKey = sharedParsers.keys().next().value
+      if (oldestKey !== undefined) sharedParsers.delete(oldestKey)
+    }
+    sharedParsers.set(key, parser)
+  }
+  return parser
+}
 
 /**
  * Creates a parser function for Comark content.
@@ -87,54 +131,33 @@ export function createMarkdownParser<const TPlugins extends readonly ComarkPlugi
     )
   }
 
-  const defaultPlugins =
-    options.registerDefaultPlugins !== false
-      ? [
-          frontmatterPlugin(),
-          // Honor deprecated `html: false` so callers can keep disabling HTML for now.
-          ...(options.html !== false ? [html()] : []),
-          alert(),
-          taskList(),
-          components(),
-          attributes(),
-        ]
-      : []
+  // Default plugins are imported on the first parse, so plugin setup and the
+  // parser lookup happen then too, once per parser function.
+  let plugins: ComarkPlugin<any, any>[] = []
+  let parser: MarkdownExit | undefined
+  let setup: Promise<void> | null = null
+  const ensureSetup = () =>
+    (setup ??= (async () => {
+      const defaultPlugins = options.registerDefaultPlugins !== false ? await loadDefaultPlugins(options) : []
+      plugins = dedupePlugins(defaultPlugins, userPlugins)
 
-  const plugins = dedupePlugins(defaultPlugins, userPlugins)
+      const mdPlugins: MarkdownExitPlugin[] = []
+      for (const plugin of plugins) {
+        for (const markdownItPlugin of plugin.markdownItPlugins || []) {
+          mdPlugins.push(markdownItPlugin as unknown as MarkdownExitPlugin)
+        }
+      }
+      parser = getSharedParser(mdPlugins, options.linkify ?? true)
+    })())
   const hasPlugin = (name: string) => plugins.some((plugin) => plugin.name === name)
-
-  const mdPlugins: MarkdownExitPlugin[] = []
-  for (const plugin of plugins) {
-    for (const markdownItPlugin of plugin.markdownItPlugins || []) {
-      mdPlugins.push(markdownItPlugin as unknown as MarkdownExitPlugin)
-    }
-  }
-
-  const linkify = options.linkify ?? true
-  const key = [
-    linkify,
-    ...mdPlugins.map((fn) => pluginIds.get(fn) ?? (pluginIds.set(fn, nextPluginId), nextPluginId++)),
-  ].join(',')
-
-  let parser = sharedParsers.get(key)
-  if (parser) {
-    // Touch for LRU: Map iteration order is insertion order.
-    sharedParsers.delete(key)
-    sharedParsers.set(key, parser)
-  } else {
-    parser = new MarkdownExit({ linkify }).enable(['table', 'strikethrough'])
-    for (const fn of mdPlugins) parser.use(fn)
-    if (sharedParsers.size >= MAX_SHARED_PARSERS) {
-      const oldestKey = sharedParsers.keys().next().value
-      if (oldestKey !== undefined) sharedParsers.delete(oldestKey)
-    }
-    sharedParsers.set(key, parser)
-  }
 
   let lastOutput: MarkdownDocument | null = null
   let lastInput: string | null = null
 
   const parseFn: ComarkParseFn = async (markdown, opts = {}) => {
+    // Only the first parse waits; later ones keep the same async steps as before.
+    if (!parser) await ensureSetup()
+
     // Root active span for the full parse pipeline. Nested startActiveSpan /
     // startSpan calls become children (OTel active context, or a stack in a
     // simple recorder) → hierarchical trace:
@@ -177,8 +200,10 @@ export function createMarkdownParser<const TPlugins extends readonly ComarkPlugi
       if (typeof autoClose === 'function') {
         state.markdown = withSpan(tracer, 'comark:autoclose', () => autoClose(state.markdown))
       } else if (autoClose) {
+        autoCloseMarkdown ??= (await import('./internal/parse/auto-close/index.ts')).autoCloseMarkdown
+        const closeMarkdown = autoCloseMarkdown
         state.markdown = withSpan(tracer, 'comark:autoclose', () =>
-          autoCloseMarkdown(state.markdown, {
+          closeMarkdown(state.markdown, {
             frontmatter: hasPlugin('frontmatter') && opts.streaming,
             syntax: hasPlugin('components'),
             attributes: hasPlugin('components') || hasPlugin('attributes'),
@@ -194,7 +219,7 @@ export function createMarkdownParser<const TPlugins extends readonly ComarkPlugi
       }
 
       try {
-        state.tokens = withSpan(tracer, 'comark:tokenize', () => parser.parse(state.markdown, {}))
+        state.tokens = withSpan(tracer, 'comark:tokenize', () => parser!.parse(state.markdown, {}))
       } catch (e) {
         // in case of streaming, return the previous output if parsing fails
         // This is to avoid resetting the tree to an empty state on failure
